@@ -1,0 +1,116 @@
+name: Convert office documents
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.docx'
+      - '**.doc'
+      - '**.odt'
+      - '**.rtf'
+      - '**.xlsx'
+      - '**.xls'
+      - '**.ods'
+      - '**.pptx'
+      - '**.ppt'
+      - '**.odp'
+      - '**.vsdx'
+      - '!pdf/**'
+      - '!preview_diff/**'
+      - '!.git/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: convert-docs-main
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install converters and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libreoffice-writer libreoffice-calc \
+            libreoffice-impress libreoffice-draw pandoc \
+            fonts-dejavu fonts-liberation
+
+      - name: Convert documents
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pdf preview_diff
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          mkdir -p "$work/pdf" "$work/diff"
+          declare -A seen=()
+
+          lo() {
+            libreoffice -env:UserInstallation="file://$work/profile" \
+              --headless --convert-to "$1" --outdir "$2" "$3"
+          }
+
+          while IFS= read -r -d '' file; do
+            rel=${file#./}
+            stem=${rel%.*}
+            ext=${rel##*.}
+            target="$stem.pdf"
+            if [[ ${seen[$target]+yes} ]]; then
+              echo "Output collision: $rel and ${seen[$target]}" >&2
+              exit 1
+            fi
+            seen[$target]=$rel
+            mkdir -p "$work/pdf/$(dirname "$stem")"
+            # Reuse unchanged PDFs to avoid timestamp-only binary changes.
+            base=$(git log -1 --format=%H -- "pdf/$target")
+            if [[ -f "pdf/$target" && -n "$base" ]]; then
+              if git diff --quiet "$base" HEAD -- "$rel"; then
+                cp "pdf/$target" "$work/pdf/$target"
+              fi
+            fi
+            if [[ ! -f "$work/pdf/$target" ]]; then
+              lo pdf "$work/pdf/$(dirname "$stem")" "$file"
+              test -s "$work/pdf/$target"
+            fi
+
+            case "$ext" in
+              docx|odt|rtf)
+                mkdir -p "$work/diff/$(dirname "$stem")"
+                pandoc "$file" -t gfm --wrap=none -o "$work/diff/$stem.md"
+                ;;
+              xlsx|xls|ods)
+                mkdir -p "$work/diff/$(dirname "$stem")"
+                lo 'csv:Text - txt - csv (StarCalc):44,34,76,1' \
+                  "$work/diff/$(dirname "$stem")" "$file"
+                test -f "$work/diff/$stem.csv"
+                ;;
+            esac
+          done < <(find . \( -path './.git' -o -path './pdf' -o -path './preview_diff' \) -prune -o \
+            -type f \( -name '*.docx' -o -name '*.doc' -o -name '*.odt' -o -name '*.rtf' \
+            -o -name '*.xlsx' -o -name '*.xls' -o -name '*.ods' -o -name '*.pptx' \
+            -o -name '*.ppt' -o -name '*.odp' -o -name '*.vsdx' \) -print0)
+
+          rsync -a --delete "$work/pdf/" pdf/
+          rsync -a --delete "$work/diff/" preview_diff/
+
+      - name: Commit and push generated files
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A -- pdf/ preview_diff/
+          if git diff --cached --quiet; then
+            echo 'No generated changes.'
+            exit 0
+          fi
+          git commit -m 'chore: update document previews'
+          git push origin HEAD:main
