@@ -1,1 +1,1 @@
-select * from some_table where some_column = 'smth'
+select * from some_table where some_column = 'smth' limit 1
